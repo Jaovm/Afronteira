@@ -132,11 +132,11 @@ st.sidebar.header("Parâmetros da Carteira")
 
 input_tickers = st.sidebar.text_area(
     "Insira os Tickers (separados por vírgula)", 
-    value="PETR4, VALE3, WEGE3, ITUB4, ABEV3"
+    value="ITUB3, TOTS3, BMOB3, TAEE3, BBSE3, WEGE3, PSSA3, EGIE3, B3SA3, VIVT3, AGRO3, PRIO3, BBAS3, BPAC11, SBSP3, SAPR4, CMIG3, TGMA3, FRAS3, CPFE3"
 )
 
 input_period = st.sidebar.slider("Histórico (Anos)", min_value=1, max_value=10, value=2)
-input_rf = st.sidebar.number_input("Taxa Livre de Risco Anual (%)", value=10.75, step=0.25)
+input_rf = st.sidebar.number_input("Taxa Livre de Risco Anual (%)", value=10.00, step=0.25)
 rf_rate = input_rf / 100
 
 btn_process = st.sidebar.button("Otimizar Carteira")
@@ -219,7 +219,7 @@ if btn_process:
                 st.markdown("#### 🚀 Fronteira Eficiente")
                 
                 # Simulação de Monte Carlo para plotar a nuvem de pontos
-                num_portfolios = 5000
+                num_portfolios = 100000
                 all_weights = np.zeros((num_portfolios, len(mu)))
                 ret_arr = np.zeros(num_portfolios)
                 vol_arr = np.zeros(num_portfolios)

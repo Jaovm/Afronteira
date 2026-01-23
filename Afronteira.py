@@ -1,261 +1,235 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.optimize import minimize
+import yfinance as yf
+import scipy.optimize as optimize
+import plotly.graph_objects as go
 
-# Configuração da Página
-st.set_page_config(page_title="Otimizador de Markowitz", layout="wide")
+# ==============================================================================
+# FUNÇÕES DE CÁLCULO E OTIMIZAÇÃO
+# ==============================================================================
 
-# ==========================================
-# Funções Auxiliares de Cálculo
-# ==========================================
-
-def get_data(tickers, period):
-    """
-    Baixa dados do Yahoo Finance e trata sufixos .SA.
-    Versão corrigida para compatibilidade com yfinance atualizado.
-    """
-    if not tickers:
-        return None
-    
-    # Tratamento dos tickers
-    ticker_list = [t.strip().upper() for t in tickers.split(',')]
-    processed_tickers = []
-    for t in ticker_list:
-        if not t.endswith('.SA') and not t.endswith('.JO') and '^' not in t and len(t) < 6:
-            processed_tickers.append(f"{t}.SA")
-        else:
-            processed_tickers.append(t)
-            
-    try:
-        # CORREÇÃO: auto_adjust=False garante que 'Adj Close' venha na resposta
-        raw_data = yf.download(processed_tickers, period=f"{period}y", auto_adjust=False)
-    except Exception as e:
-        st.error(f"Erro ao baixar dados: {e}")
-        return None
-
-    # Verifica se algum dado foi baixado
-    if raw_data is None or raw_data.empty:
-        return None
-
-    # Lógica robusta para selecionar a coluna de preço
-    if 'Adj Close' in raw_data:
-        data = raw_data['Adj Close']
-    elif 'Close' in raw_data:
-        data = raw_data['Close']
-    else:
-        st.error("Não foi possível encontrar colunas de preço ('Adj Close' ou 'Close').")
-        return None
-    
-    # Remove colunas vazias e linhas com NaN
-    data = data.dropna(axis=1, how='all')
-    data = data.dropna()
-    
+def get_data(tickers, start_date, end_date):
+    """Baixa os dados ajustados do Yahoo Finance."""
+    data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
     return data
 
+def min_func_sharpe(weights, mean_returns, cov_matrix, risk_free_rate):
+    """Função Objetivo: Maximizar Sharpe (Minimizar Sharpe Negativo)."""
+    p_ret = np.sum(weights * mean_returns) * 252
+    p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
+    sharpe = (p_ret - risk_free_rate) / p_vol
+    return -sharpe
 
-def calculate_metrics(data):
-    """Calcula retornos logarítmicos, média e matriz de covariância."""
-    log_returns = np.log(data / data.shift(1)).dropna()
-    mean_returns = log_returns.mean() * 252
-    cov_matrix = log_returns.cov() * 252
-    return log_returns, mean_returns, cov_matrix
+def min_func_sharpe_distributed(weights, mean_returns, cov_matrix, risk_free_rate, lambda_reg=2.0):
+    """
+    Função Objetivo: Maximizar Sharpe com Regularização L2 (Ridge).
+    
+    Objetivo: Minimizar (-Sharpe + lambda * sum(weights^2))
+    
+    Racional:
+    A maximização tradicional do Sharpe tende a concentrar pesos nos ativos de melhor 
+    performance histórica (soluções de canto). Ao adicionar a penalidade (lambda * sum(w^2)),
+    criamos uma 'pressão' matemática que favorece a diversificação (pesos distribuídos),
+    impedindo que ativos fiquem 'presos' apenas no limite mínimo definido.
+    """
+    # 1. Métricas da Carteira
+    p_ret = np.sum(weights * mean_returns) * 252
+    p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
+    
+    # 2. Sharpe Ratio
+    sharpe = (p_ret - risk_free_rate) / p_vol
+    
+    # 3. Penalidade por Concentração (L2 Regularization)
+    # Quanto mais concentrada a carteira, maior a soma dos quadrados.
+    penalty = lambda_reg * np.sum(weights**2)
+    
+    # Retorna valor a minimizar
+    return -sharpe + penalty
 
-def portfolio_performance(weights, mean_returns, cov_matrix, risk_free_rate):
-    """Calcula retorno, volatilidade e Sharpe Ratio de uma carteira."""
-    returns = np.sum(mean_returns * weights)
-    std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-    sharpe = (returns - risk_free_rate) / std
-    return returns, std, sharpe
+def min_func_volatility(weights, mean_returns, cov_matrix, risk_free_rate):
+    """Função Objetivo: Minimizar Volatilidade."""
+    p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
+    return p_vol
 
-# ==========================================
-# Funções de Otimização (SciPy)
-# ==========================================
-
-def neg_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
-    """Maximizar Sharpe (Minimizar Negativo)"""
-    p_ret, p_var, p_sharpe = portfolio_performance(weights, mean_returns, cov_matrix, risk_free_rate)
-    return -p_sharpe
-
-def portfolio_volatility(weights, mean_returns, cov_matrix, risk_free_rate):
-    """Minimizar Volatilidade"""
-    p_ret, p_var, p_sharpe = portfolio_performance(weights, mean_returns, cov_matrix, risk_free_rate)
-    return p_var
-
-def neg_total_return(weights, mean_returns, cov_matrix, risk_free_rate):
-    """Maximizar Retorno Total (Minimizar Negativo) - Novo para suportar restrições"""
-    p_ret, p_var, p_sharpe = portfolio_performance(weights, mean_returns, cov_matrix, risk_free_rate)
+def min_func_return(weights, mean_returns, cov_matrix, risk_free_rate):
+    """Função Objetivo: Maximizar Retorno (Minimizar Retorno Negativo)."""
+    p_ret = np.sum(weights * mean_returns) * 252
     return -p_ret
 
-def optimize_portfolio(mean_returns, cov_matrix, risk_free_rate, objective_function, min_w, max_w):
-    """
-    Executa a otimização via SLSQP com limites personalizados por ativo.
-    """
-    num_assets = len(mean_returns)
-    args = (mean_returns, cov_matrix, risk_free_rate)
-    
-    # Restrições: Soma dos pesos = 1
-    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-    
-    # Limites: definidos pelo usuário (min_w <= peso <= max_w)
-    bounds = tuple((min_w, max_w) for asset in range(num_assets))
-    
-    # Chute inicial (pesos iguais)
-    init_guess = num_assets * [1. / num_assets,]
-    
-    result = minimize(objective_function, init_guess, args=args, 
-                      method='SLSQP', bounds=bounds, constraints=constraints)
-    
-    return result
+# ==============================================================================
+# CONFIGURAÇÃO DA PÁGINA STREAMLIT
+# ==============================================================================
 
-# ==========================================
-# Interface do Usuário
-# ==========================================
+st.set_page_config(page_title="Otimizador de Carteira", layout="wide")
 
-st.title("📈 Otimizador de Carteira (Markowitz)")
-st.markdown("---")
+st.title("📈 Otimizador de Carteira - Markowitz & Diversificação")
+st.markdown("""
+Esta ferramenta utiliza a Teoria Moderna do Portfólio para encontrar a alocação ótima de ativos.
+Agora inclui algoritmos de regularização para evitar concentração excessiva.
+""")
 
-# Sidebar - Inputs
-st.sidebar.header("Parâmetros da Carteira")
+# --- Sidebar: Parâmetros de Entrada ---
+st.sidebar.header('Parâmetros do Portfólio')
 
-input_tickers = st.sidebar.text_area(
-    "Insira os Tickers (separados por vírgula)", 
-    value="ITUB3, TOTS3, BMOB3, TAEE3, BBSE3, WEGE3, PSSA3, EGIE3, B3SA3, VIVT3, AGRO3, PRIO3, BBAS3, BPAC11, SBSP3, SAPR4, CMIG3, TGMA3, FRAS3, CPFE3"
+# Input dos Tickers
+tickers_input = st.sidebar.text_area(
+    'Insira os Tickers (separados por vírgula):', 
+    'PETR4.SA, VALE3.SA, WEGE3.SA, ITUB4.SA, BBDC4.SA, ABEV3.SA'
+)
+tickers = [t.strip() for t in tickers_input.split(',')]
+
+# Datas
+start_date = st.sidebar.date_input('Data de Início', pd.to_datetime('2020-01-01'))
+end_date = st.sidebar.date_input('Data Final', pd.to_datetime('today'))
+
+# Taxa Livre de Risco
+risk_free_rate = st.sidebar.number_input('Taxa Livre de Risco Anual (decimal)', value=0.10, step=0.01)
+
+# Restrições de Peso
+st.sidebar.subheader('Restrições de Alocação')
+min_wt = st.sidebar.slider('Peso Mínimo por Ativo', 0.0, 0.5, 0.01, step=0.01)
+max_wt = st.sidebar.slider('Peso Máximo por Ativo', 0.0, 1.0, 1.0, step=0.05)
+
+# Objetivo da Otimização
+goal = st.sidebar.selectbox(
+    'Objetivo da Otimização',
+    (
+        'Maximizar Sharpe Ratio', 
+        'Maximizar Sharpe Ratio (todos os ativos)', # NOVA OPÇÃO
+        'Minimizar Volatilidade', 
+        'Maximizar Retorno'
+    )
 )
 
-input_period = st.sidebar.slider("Histórico (Anos)", min_value=1, max_value=10, value=2)
-input_rf = st.sidebar.number_input("Taxa Livre de Risco Anual (%)", value=10.00, step=0.25)
-rf_rate = input_rf / 100
+# Botão de Execução
+run_button = st.sidebar.button('Otimizar Carteira')
 
-st.sidebar.markdown("---")
-st.sidebar.header("Restrições de Alocação")
-# Novos Inputs para limites de alocação
-input_min_w = st.sidebar.slider("Alocação Mínima por Ativo (%)", 0.0, 50.0, 0.0, 0.5) / 100
-input_max_w = st.sidebar.slider("Alocação Máxima por Ativo (%)", 0.0, 100.0, 100.0, 1.0) / 100
+# ==============================================================================
+# LÓGICA PRINCIPAL
+# ==============================================================================
 
-btn_process = st.sidebar.button("Otimizar Carteira")
+if run_button:
+    with st.spinner('Baixando dados e otimizando...'):
+        try:
+            # 1. Obtenção e Tratamento dos Dados
+            df = get_data(tickers, start_date, end_date)
+            
+            if df.empty:
+                st.error("Não foi possível baixar dados. Verifique os tickers.")
+                st.stop()
+            
+            # Cálculo de retornos diários e matriz de covariância
+            returns = df.pct_change().dropna()
+            mean_returns = returns.mean()
+            cov_matrix = returns.cov()
+            num_assets = len(tickers)
 
-if btn_process:
-    with st.spinner('Baixando dados e processando...'):
-        # 1. Obtenção de Dados
-        df_prices = get_data(input_tickers, input_period)
-        
-        if df_prices is None or len(df_prices.columns) < 2:
-            st.error("Erro: Dados insuficientes. Insira pelo menos 2 tickers válidos.")
-        else:
-            # Validação matemática básica das restrições
-            num_assets_found = len(df_prices.columns)
-            if input_min_w > input_max_w:
-                st.error("Erro: A alocação mínima não pode ser maior que a máxima.")
-            elif (input_min_w * num_assets_found) > 1.0:
-                st.error(f"Erro: Alocação mínima de {input_min_w:.1%} para {num_assets_found} ativos excede 100% da carteira.")
-            else:
-                # 2. Cálculos Estatísticos
-                log_ret, mu, S = calculate_metrics(df_prices)
-                tickers_found = df_prices.columns.tolist()
-                
-                st.success(f"Dados baixados com sucesso para {len(tickers_found)} ativos.")
-                
-                # 3. Otimizações com Bounds Personalizados
-                
-                # A) Máximo Sharpe Ratio
-                max_sharpe_result = optimize_portfolio(mu, S, rf_rate, neg_sharpe_ratio, input_min_w, input_max_w)
-                w_sharpe = max_sharpe_result.x
-                ret_sharpe, vol_sharpe, sr_sharpe = portfolio_performance(w_sharpe, mu, S, rf_rate)
-                
-                # B) Mínima Variância
-                min_vol_result = optimize_portfolio(mu, S, rf_rate, portfolio_volatility, input_min_w, input_max_w)
-                w_min_vol = min_vol_result.x
-                ret_min_vol, vol_min_vol, sr_min_vol = portfolio_performance(w_min_vol, mu, S, rf_rate)
-                
-                # C) Maior Retorno Esperado (Agora respeitando os limites)
-                # Substituímos a lógica de pegar 100% no max(mu) por uma otimização
-                max_ret_result = optimize_portfolio(mu, S, rf_rate, neg_total_return, input_min_w, input_max_w)
-                w_max_ret = max_ret_result.x
-                ret_max_ret, vol_max_ret, sr_max_ret = portfolio_performance(w_max_ret, mu, S, rf_rate)
+            # 2. Configuração da Otimização (Scipy)
+            
+            # Chute inicial (Equal Weights)
+            init_guess = num_assets * [1. / num_assets,]
+            
+            # Bounds (Limites min e max para cada ativo)
+            bounds = tuple((min_wt, max_wt) for asset in range(num_assets))
+            
+            # Constraints (Soma dos pesos deve ser igual a 1)
+            constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
 
-                # ==========================================
-                # Visualização dos Resultados
-                # ==========================================
+            # Seleção da Função Objetivo
+            if goal == 'Maximizar Sharpe Ratio':
+                fun_to_optimize = min_func_sharpe
+                args_optimization = (mean_returns, cov_matrix, risk_free_rate)
                 
-                st.markdown("### 📊 Comparativo de Carteiras Ótimas")
+            elif goal == 'Maximizar Sharpe Ratio (todos os ativos)':
+                # Aqui usamos a função com regularização
+                fun_to_optimize = min_func_sharpe_distributed
+                # O parâmetro lambda_reg=2.0 está fixo dentro da função ou pode ser passado aqui se alterarmos a assinatura
+                args_optimization = (mean_returns, cov_matrix, risk_free_rate)
                 
-                # DataFrame de Métricas
-                metrics_data = {
-                    "Métrica": ["Retorno Esperado (a.a.)", "Volatilidade (a.a.)", "Sharpe Ratio"],
-                    "Máximo Sharpe": [f"{ret_sharpe:.2%}", f"{vol_sharpe:.2%}", f"{sr_sharpe:.2f}"],
-                    "Mínima Volatilidade": [f"{ret_min_vol:.2%}", f"{vol_min_vol:.2%}", f"{sr_min_vol:.2f}"],
-                    "Máximo Retorno": [f"{ret_max_ret:.2%}", f"{vol_max_ret:.2%}", f"{sr_max_ret:.2f}"]
-                }
-                st.table(pd.DataFrame(metrics_data).set_index("Métrica"))
+            elif goal == 'Minimizar Volatilidade':
+                fun_to_optimize = min_func_volatility
+                args_optimization = (mean_returns, cov_matrix, risk_free_rate)
+                
+            elif goal == 'Maximizar Retorno':
+                fun_to_optimize = min_func_return
+                args_optimization = (mean_returns, cov_matrix, risk_free_rate)
 
-                st.markdown("### ⚖️ Alocação de Ativos (Pesos)")
-                
-                # DataFrame de Pesos
-                weights_df = pd.DataFrame({
-                    "Ativo": tickers_found,
-                    "Max Sharpe": w_sharpe,
-                    "Min Volatilidade": w_min_vol,
-                    "Max Retorno": w_max_ret
-                }).set_index("Ativo")
-                
-                # Formatação e Exibição
-                st.dataframe(weights_df.style.format("{:.2%}")
-                             .background_gradient(cmap='Greens', axis=0))
+            # 3. Execução da Otimização
+            result = optimize.minimize(
+                fun_to_optimize,
+                init_guess,
+                args=args_optimization,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints
+            )
 
-                # ==========================================
-                # Gráficos
-                # ==========================================
+            if not result.success:
+                st.warning(f"A otimização pode não ter convergido perfeitamente: {result.message}")
+
+            opt_weights = result.x
+
+            # 4. Cálculo das Métricas Finais da Carteira Otimizada
+            opt_ret = np.sum(opt_weights * mean_returns) * 252
+            opt_vol = np.sqrt(np.dot(opt_weights.T, np.dot(cov_matrix, opt_weights))) * np.sqrt(252)
+            opt_sharpe = (opt_ret - risk_free_rate) / opt_vol
+
+            # ==============================================================================
+            # EXIBIÇÃO DOS RESULTADOS
+            # ==============================================================================
+            
+            st.success("Otimização Concluída!")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Retorno Esperado (a.a.)", f"{opt_ret:.2%}")
+            col2.metric("Volatilidade (a.a.)", f"{opt_vol:.2%}")
+            col3.metric("Sharpe Ratio", f"{opt_sharpe:.2f}")
+
+            # --- Tabela de Pesos ---
+            st.subheader("Alocação Sugerida")
+            
+            # Criar DataFrame para exibição
+            df_weights = pd.DataFrame({
+                'Ticker': tickers,
+                'Peso': opt_weights
+            })
+            
+            # Ordenar e formatar
+            df_weights = df_weights.sort_values(by='Peso', ascending=False)
+            df_weights['Peso (%)'] = (df_weights['Peso'] * 100).map('{:.2f}%'.format)
+            
+            # Exibir lado a lado com gráfico de pizza
+            c1, c2 = st.columns([1, 2])
+            
+            with c1:
+                st.dataframe(df_weights[['Ticker', 'Peso (%)']], use_container_width=True)
                 
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("#### 🔥 Correlação entre Ativos")
-                    fig_corr, ax_corr = plt.subplots(figsize=(8, 6))
-                    sns.heatmap(log_ret.corr(), annot=True, cmap='coolwarm', fmt=".2f", linewidths=0.5, ax=ax_corr)
-                    st.pyplot(fig_corr)
-                    
-                with col2:
-                    st.markdown("#### 🚀 Fronteira Eficiente")
-                    
-                    # Simulação de Monte Carlo para plotar a nuvem de pontos
-                    # Nota: A simulação aleatória simples não obedece estritamente aos bounds complexos
-                    # Para visualização rápida, mantemos a geração simples, mas normalizada
-                    num_portfolios = 50000 
-                    all_weights = np.zeros((num_portfolios, len(mu)))
-                    ret_arr = np.zeros(num_portfolios)
-                    vol_arr = np.zeros(num_portfolios)
-                    sharpe_arr = np.zeros(num_portfolios)
+            with c2:
+                fig_pie = go.Figure(data=[go.Pie(labels=df_weights['Ticker'], values=df_weights['Peso'], hole=.3)])
+                fig_pie.update_layout(title_text="Distribuição da Carteira")
+                st.plotly_chart(fig_pie, use_container_width=True)
 
-                    for i in range(num_portfolios):
-                        # Geração de pesos aleatórios tentando respeitar limites (aproximação visual)
-                        # Na prática, a nuvem mostra o 'universo possível', os pontos estrelados mostram o ótimo restrito
-                        weights = np.array(np.random.random(len(mu)))
-                        weights = weights / np.sum(weights)
-                        
-                        ret_arr[i], vol_arr[i], sharpe_arr[i] = portfolio_performance(weights, mu, S, rf_rate)
+            # --- Backtest Simples (Gráfico de Linha) ---
+            st.subheader("Performance Histórica Acumulada (Simulação)")
+            
+            # Retorno da Carteira Diária
+            portfolio_daily_returns = (returns * opt_weights).sum(axis=1)
+            cumulative_returns = (1 + portfolio_daily_returns).cumprod()
+            
+            # Gráfico de Linha
+            fig_line = go.Figure()
+            fig_line.add_trace(go.Scatter(x=cumulative_returns.index, y=cumulative_returns, mode='lines', name='Carteira Otimizada'))
+            fig_line.update_layout(title='Crescimento de R$ 1,00', yaxis_title='Retorno Acumulado', xaxis_title='Data')
+            st.plotly_chart(fig_line, use_container_width=True)
+            
+            # Exibir explicação extra se a nova opção foi escolhida
+            if goal == 'Maximizar Sharpe Ratio (todos os ativos)':
+                st.info("""
+                ℹ️ **Nota Técnica:** Esta otimização utilizou Regularização L2 para penalizar concentrações excessivas. 
+                Observe que os pesos tendem a ser distribuídos de forma mais equilibrada entre os ativos, 
+                evitando 'soluções de canto' onde a maioria dos ativos ficaria apenas no peso mínimo.
+                """)
 
-                    fig_ef, ax_ef = plt.subplots(figsize=(8, 6))
-                    
-                    # Scatter plot da nuvem
-                    sc = ax_ef.scatter(vol_arr, ret_arr, c=sharpe_arr, cmap='viridis', marker='.', alpha=0.3)
-                    plt.colorbar(sc, label='Sharpe Ratio')
-                    
-                    # Plotar pontos ótimos (Calculados com as restrições corretas)
-                    ax_ef.scatter(vol_sharpe, ret_sharpe, marker='*', color='r', s=200, label='Max Sharpe (Restrito)')
-                    ax_ef.scatter(vol_min_vol, ret_min_vol, marker='*', color='b', s=200, label='Min Vol (Restrito)')
-                    ax_ef.scatter(vol_max_ret, ret_max_ret, marker='*', color='g', s=200, label='Max Ret (Restrito)')
-                    
-                    ax_ef.set_title(f'Fronteira Eficiente & Pontos Otimizados')
-                    ax_ef.set_xlabel('Volatilidade Anual')
-                    ax_ef.set_ylabel('Retorno Esperado Anual')
-                    ax_ef.legend(loc='best')
-                    ax_ef.grid(True, linestyle='--', alpha=0.6)
-                    
-                    st.pyplot(fig_ef)
-
-else:
-    st.info("Utilize a barra lateral para configurar os parâmetros e clique em 'Otimizar Carteira'.")
+        except Exception as e:
+            st.error(f"Ocorreu um erro durante a execução: {e}")

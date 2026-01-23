@@ -224,7 +224,7 @@ if btn_process:
                     # Simulação de Monte Carlo para plotar a nuvem de pontos
                     # Nota: A simulação aleatória simples não obedece estritamente aos bounds complexos
                     # Para visualização rápida, mantemos a geração simples, mas normalizada
-                    num_portfolios = 50000 
+                    num_portfolios = 500000 
                     all_weights = np.zeros((num_portfolios, len(mu)))
                     ret_arr = np.zeros(num_portfolios)
                     vol_arr = np.zeros(num_portfolios)

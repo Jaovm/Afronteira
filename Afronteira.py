@@ -1,181 +1,219 @@
 import streamlit as st
-import numpy as np
-import pandas as pd
-from scipy.optimize import minimize
 import yfinance as yf
+import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
+from scipy.optimize import minimize
 
-# Função para baixar dados históricos
-def download_data(tickers, period_years):
-    end_date = pd.Timestamp.now()
-    start_date = end_date - pd.DateOffset(years=period_years)
-    data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
-    return data
+# Configuração da página
+st.set_page_config(page_title="Otimizador de Carteira Markowitz", layout="wide")
 
-# Função para calcular retornos logarítmicos
-def calculate_log_returns(prices):
-    return np.log(prices / prices.shift(1)).dropna()
+# Estilo para os gráficos
+plt.style.use('ggplot')
 
-# Função para anualizar retornos e volatilidade
-def annualize_returns(returns, num_periods=252):
-    return returns.mean() * num_periods
+def get_stock_data(tickers, start_date, end_date):
+    """Baixa dados do Yahoo Finance com tratamento para tickers B3."""
+    data = pd.DataFrame()
+    valid_tickers = []
+    
+    for t in tickers:
+        t = t.strip().upper()
+        # Tentativa simples de identificar tickers BR sem sufixo
+        if not t.endswith('.SA') and len(t) <= 6 and any(char.isdigit() for char in t):
+             # Verifica se é um ticker comum da B3 (ex: PETR4)
+            ticker_sa = f"{t}.SA"
+        else:
+            ticker_sa = t
+            
+        try:
+            # Tenta baixar com .SA (prioridade se parecer BR) ou original
+            temp = yf.download(ticker_sa, start=start_date, end=end_date, progress=False)
+            if not temp.empty:
+                data[t] = temp['Adj Close']
+                valid_tickers.append(t)
+            else:
+                # Fallback: se falhou com .SA, tenta sem (ou vice-versa se necessário, mas simplificado aqui)
+                temp = yf.download(t, start=start_date, end=end_date, progress=False)
+                if not temp.empty:
+                    data[t] = temp['Adj Close']
+                    valid_tickers.append(t)
+        except Exception:
+            continue
+            
+    return data, valid_tickers
 
-def annualize_volatility(returns, num_periods=252):
-    return returns.std() * np.sqrt(num_periods)
+def calculate_metrics(weights, mean_returns, cov_matrix, risk_free_rate):
+    """Calcula retorno, volatilidade e Sharpe Ratio da carteira."""
+    weights = np.array(weights)
+    portfolio_return = np.sum(mean_returns * weights) * 252
+    portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))
+    sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+    return portfolio_return, portfolio_volatility, sharpe_ratio
 
-# Função para calcular retorno da carteira
-def portfolio_return(weights, returns):
-    return np.dot(weights, returns)
+def neg_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
+    """Função objetivo para maximizar Sharpe (minimizar negativo)."""
+    p_ret, p_vol, p_sr = calculate_metrics(weights, mean_returns, cov_matrix, risk_free_rate)
+    return -p_sr
 
-# Função para calcular volatilidade da carteira
-def portfolio_volatility(weights, cov_matrix):
-    return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+def portfolio_volatility_func(weights, mean_returns, cov_matrix, risk_free_rate):
+    """Função objetivo para minimizar volatilidade."""
+    p_ret, p_vol, p_sr = calculate_metrics(weights, mean_returns, cov_matrix, risk_free_rate)
+    return p_vol
 
-# Função para calcular Sharpe Ratio
-def sharpe_ratio(weights, returns, cov_matrix, risk_free_rate):
-    ret = portfolio_return(weights, returns)
-    vol = portfolio_volatility(weights, cov_matrix)
-    return (ret - risk_free_rate) / vol
+def neg_portfolio_return(weights, mean_returns, cov_matrix, risk_free_rate):
+    """Função objetivo para maximizar retorno (minimizar negativo)."""
+    p_ret, p_vol, p_sr = calculate_metrics(weights, mean_returns, cov_matrix, risk_free_rate)
+    return -p_ret
 
-# Função de otimização genérica
-def optimize_portfolio(objective_func, returns, cov_matrix, risk_free_rate, bounds, constraints):
-    num_assets = len(returns)
-    initial_guess = np.array(num_assets * [1. / num_assets])
-    result = minimize(objective_func, initial_guess, args=(returns, cov_matrix, risk_free_rate),
+def optimize_portfolio(mean_returns, cov_matrix, num_assets, risk_free_rate, objective_function):
+    """Executa a otimização via SciPy."""
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    bounds = tuple((0, 1) for _ in range(num_assets))
+    init_guess = num_assets * [1. / num_assets,]
+    
+    result = minimize(objective_function, init_guess, 
+                      args=(mean_returns, cov_matrix, risk_free_rate),
                       method='SLSQP', bounds=bounds, constraints=constraints)
     return result
 
-# Objetivos de otimização
-def neg_sharpe_ratio(weights, returns, cov_matrix, risk_free_rate):
-    return -sharpe_ratio(weights, returns, cov_matrix, risk_free_rate)
+# --- Interface Sidebar ---
+st.sidebar.header("Parâmetros da Carteira")
 
-def neg_portfolio_return(weights, returns, cov_matrix, risk_free_rate):
-    return -portfolio_return(weights, returns)
+input_tickers = st.sidebar.text_area("Tickers (separados por vírgula)", "PETR4, VALE3, WEGE3, ITUB4, BOVA11")
+years = st.sidebar.number_input("Período de análise (anos)", min_value=1, max_value=10, value=3)
+risk_free = st.sidebar.number_input("Taxa Livre de Risco Anual (%)", min_value=0.0, max_value=20.0, value=10.0) / 100
 
-def portfolio_variance(weights, returns, cov_matrix, risk_free_rate):
-    return portfolio_volatility(weights, cov_matrix) ** 2
+run_btn = st.sidebar.button("Otimizar Carteira")
 
-# Função para gerar fronteira eficiente
-def efficient_frontier(returns, cov_matrix, num_portfolios=100):
-    target_returns = np.linspace(returns.min(), returns.max(), num_portfolios)
-    efficient_portfolios = []
-    bounds = [(0, 1) for _ in returns]
-    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+# --- Lógica Principal ---
+if run_btn:
+    ticker_list = [x.strip() for x in input_tickers.split(',') if x.strip()]
     
-    for target in target_returns:
-        cons = constraints.copy()
-        cons = ({'type': 'eq', 'fun': lambda x: portfolio_return(x, returns) - target},
-                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-        result = minimize(portfolio_variance, np.array(len(returns) * [1. / len(returns)]),
-                          args=(returns, cov_matrix, 0), method='SLSQP', bounds=bounds, constraints=cons)
-        if result.success:
-            efficient_portfolios.append((target, np.sqrt(result.fun)))
-    return efficient_portfolios
-
-# Configuração da interface Streamlit
-st.title("Otimização de Carteira de Investimentos - Modelo de Markowitz")
-
-# Inputs do usuário
-tickers_input = st.text_input("Tickers da carteira (separados por vírgulas, ex: PETR4, VALE3, ITUB4)", "")
-period_years = st.number_input("Período histórico de análise (em anos)", min_value=1, value=5)
-risk_free_rate = st.number_input("Taxa livre de risco (em decimal, ex: 0.05 para 5%)", value=0.05)
-
-if st.button("Otimizar Carteira"):
-    if not tickers_input:
-        st.error("Por favor, insira os tickers.")
+    if len(ticker_list) < 2:
+        st.error("Por favor, insira pelo menos 2 ativos para otimização.")
     else:
-        try:
-            # Processar tickers
-            tickers = [t.strip().upper() + ('.SA' if not t.strip().upper().endswith('.SA') else '') for t in tickers_input.split(',')]
+        with st.spinner('Baixando dados e calculando...'):
+            end_date = pd.Timestamp.now()
+            start_date = end_date - pd.DateOffset(years=years)
             
-            # Baixar dados
-            prices = download_data(tickers, period_years)
-            if prices.empty or prices.isnull().all().all():
-                raise ValueError("Dados históricos não disponíveis para os tickers informados.")
+            df_prices, valid_tickers = get_stock_data(ticker_list, start_date, end_date)
             
-            # Calcular retornos logarítmicos
-            log_returns = calculate_log_returns(prices)
-            
-            # Matriz de covariância e correlação (anualizadas)
-            cov_matrix = log_returns.cov() * 252
-            corr_matrix = log_returns.corr()
-            
-            # Retornos esperados anualizados
-            expected_returns = annualize_returns(log_returns)
-            
-            # Volatilidade anualizada (não usada diretamente)
-            # volatility = annualize_volatility(log_returns)
-            
-            # Configurações de otimização
-            num_assets = len(tickers)
-            bounds = [(0, 1) for _ in range(num_assets)]
-            constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-            
-            # Otimização para maior Sharpe Ratio
-            max_sharpe = optimize_portfolio(neg_sharpe_ratio, expected_returns, cov_matrix, risk_free_rate, bounds, constraints)
-            
-            # Otimização para maior retorno esperado
-            max_return = optimize_portfolio(neg_portfolio_return, expected_returns, cov_matrix, risk_free_rate, bounds, constraints)
-            
-            # Otimização para menor risco (variância mínima)
-            min_variance = optimize_portfolio(portfolio_variance, expected_returns, cov_matrix, risk_free_rate, bounds, constraints)
-            
-            # Função para extrair resultados
-            def get_results(opt_result, returns, cov_matrix, risk_free_rate):
-                weights = opt_result.x
-                ret = portfolio_return(weights, returns)
-                vol = portfolio_volatility(weights, cov_matrix)
-                sharpe = (ret - risk_free_rate) / vol
-                return weights, ret, vol, sharpe
-            
-            # Resultados
-            sharpe_weights, sharpe_ret, sharpe_vol, sharpe_sr = get_results(max_sharpe, expected_returns, cov_matrix, risk_free_rate)
-            return_weights, return_ret, return_vol, return_sr = get_results(max_return, expected_returns, cov_matrix, risk_free_rate)
-            variance_weights, variance_ret, variance_vol, variance_sr = get_results(min_variance, expected_returns, cov_matrix, risk_free_rate)
-            
-            # Apresentar resultados em tabelas
-            results_df = pd.DataFrame({
-                'Carteira': ['Maior Sharpe Ratio', 'Maior Retorno Esperado', 'Menor Risco'],
-                'Retorno Anual Esperado': [sharpe_ret, return_ret, variance_ret],
-                'Volatilidade Anual': [sharpe_vol, return_vol, variance_vol],
-                'Sharpe Ratio': [sharpe_sr, return_sr, variance_sr]
-            })
-            st.subheader("Resultados das Carteiras Otimizadas")
-            st.dataframe(results_df.style.format("{:.4f}"))
-            
-            # Pesos ótimos
-            weights_df = pd.DataFrame({
-                'Ativo': tickers,
-                'Maior Sharpe Ratio': sharpe_weights,
-                'Maior Retorno Esperado': return_weights,
-                'Menor Risco': variance_weights
-            })
-            st.subheader("Pesos Ótimos por Ativo")
-            st.dataframe(weights_df.style.format("{:.4f}", subset=weights_df.columns[1:]))
-            
-            # Visualizações
-            st.subheader("Heatmap de Correlação entre Ativos")
-            fig, ax = plt.subplots()
-            sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', ax=ax)
-            st.pyplot(fig)
-            
-            # Fronteira Eficiente (opcional)
-            st.subheader("Fronteira Eficiente")
-            efficient = efficient_frontier(expected_returns, cov_matrix)
-            if efficient:
-                rets, vols = zip(*efficient)
-                fig_ef, ax_ef = plt.subplots()
-                ax_ef.plot(vols, rets, 'b--')
-                ax_ef.scatter(sharpe_vol, sharpe_ret, color='green', label='Maior Sharpe')
-                ax_ef.scatter(return_vol, return_ret, color='blue', label='Maior Retorno')
-                ax_ef.scatter(variance_vol, variance_ret, color='red', label='Menor Risco')
-                ax_ef.set_xlabel('Volatilidade')
-                ax_ef.set_ylabel('Retorno Esperado')
-                ax_ef.legend()
-                st.pyplot(fig_ef)
+            if df_prices.empty or len(valid_tickers) < 2:
+                st.error("Não foi possível baixar dados suficientes. Verifique os tickers.")
             else:
-                st.warning("Não foi possível gerar a fronteira eficiente.")
-        
-        except Exception as e:
-            st.error(f"Erro ao processar os dados: {str(e)}")
+                st.success(f"Dados baixados para: {', '.join(valid_tickers)}")
+                
+                # Cálculos Estatísticos
+                log_returns = np.log(df_prices / df_prices.shift(1)).dropna()
+                mean_returns = log_returns.mean()
+                cov_matrix = log_returns.cov()
+                corr_matrix = log_returns.corr()
+                num_assets = len(valid_tickers)
+
+                # --- Otimizações ---
+                
+                # 1. Max Sharpe Ratio
+                opt_sharpe = optimize_portfolio(mean_returns, cov_matrix, num_assets, risk_free, neg_sharpe_ratio)
+                ret_sharpe, vol_sharpe, sr_sharpe = calculate_metrics(opt_sharpe.x, mean_returns, cov_matrix, risk_free)
+                
+                # 2. Mínima Variância (Risco)
+                opt_min_vol = optimize_portfolio(mean_returns, cov_matrix, num_assets, risk_free, portfolio_volatility_func)
+                ret_min_vol, vol_min_vol, sr_min_vol = calculate_metrics(opt_min_vol.x, mean_returns, cov_matrix, risk_free)
+                
+                # 3. Retorno Máximo
+                opt_max_ret = optimize_portfolio(mean_returns, cov_matrix, num_assets, risk_free, neg_portfolio_return)
+                ret_max_ret, vol_max_ret, sr_max_ret = calculate_metrics(opt_max_ret.x, mean_returns, cov_matrix, risk_free)
+
+                # --- Exibição dos Resultados ---
+                
+                st.subheader("Resultados das Carteiras Otimizadas")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                # Formatação de dados para exibição
+                def format_metrics(ret, vol, sr):
+                    return f"Retorno: {ret:.2%}", f"Volatilidade: {vol:.2%}", f"Sharpe: {sr:.2f}"
+
+                r_s, v_s, s_s = format_metrics(ret_sharpe, vol_sharpe, sr_sharpe)
+                r_v, v_v, s_v = format_metrics(ret_min_vol, vol_min_vol, sr_min_vol)
+                r_r, v_r, s_r = format_metrics(ret_max_ret, vol_max_ret, sr_max_ret)
+
+                with col1:
+                    st.info(f"**Máximo Sharpe**\n\n{r_s}\n\n{v_s}\n\n{s_s}")
+                with col2:
+                    st.warning(f"**Mínima Volatilidade**\n\n{r_v}\n\n{v_v}\n\n{s_v}")
+                with col3:
+                    st.success(f"**Máximo Retorno**\n\n{r_r}\n\n{v_r}\n\n{s_r}")
+
+                # Tabela de Pesos
+                st.subheader("Alocação de Ativos (Pesos %)")
+                weights_df = pd.DataFrame({
+                    "Max Sharpe": opt_sharpe.x * 100,
+                    "Min Volatilidade": opt_min_vol.x * 100,
+                    "Max Retorno": opt_max_ret.x * 100
+                }, index=valid_tickers)
+                st.dataframe(weights_df.style.format("{:.2f}%"))
+
+                # --- Visualizações ---
+                
+                col_graph1, col_graph2 = st.columns(2)
+                
+                # 1. Heatmap de Correlação
+                with col_graph1:
+                    st.markdown("### Correlação entre Ativos")
+                    fig_corr, ax_corr = plt.subplots(figsize=(8, 6))
+                    cax = ax_corr.matshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+                    fig_corr.colorbar(cax)
+                    
+                    ticks = np.arange(0, len(valid_tickers), 1)
+                    ax_corr.set_xticks(ticks)
+                    ax_corr.set_yticks(ticks)
+                    ax_corr.set_xticklabels(valid_tickers, rotation=45, ha="left")
+                    ax_corr.set_yticklabels(valid_tickers)
+                    
+                    # Adicionar valores no heatmap
+                    for i in range(len(valid_tickers)):
+                        for j in range(len(valid_tickers)):
+                            text = ax_corr.text(j, i, f"{corr_matrix.iloc[i, j]:.2f}",
+                                           ha="center", va="center", color="black", fontsize=8)
+                            
+                    st.pyplot(fig_corr)
+
+                # 2. Fronteira Eficiente (Monte Carlo)
+                with col_graph2:
+                    st.markdown("### Fronteira Eficiente")
+                    
+                    # Simulação Monte Carlo para fundo do gráfico
+                    num_simulations = 5000
+                    all_weights = np.zeros((num_simulations, num_assets))
+                    ret_arr = np.zeros(num_simulations)
+                    vol_arr = np.zeros(num_simulations)
+                    sharpe_arr = np.zeros(num_simulations)
+
+                    for i in range(num_simulations):
+                        w = np.random.random(num_assets)
+                        w /= np.sum(w)
+                        all_weights[i,:] = w
+                        r, v, s = calculate_metrics(w, mean_returns, cov_matrix, risk_free)
+                        ret_arr[i] = r
+                        vol_arr[i] = v
+                        sharpe_arr[i] = s
+
+                    fig_ef, ax_ef = plt.subplots(figsize=(8, 6))
+                    sc = ax_ef.scatter(vol_arr, ret_arr, c=sharpe_arr, cmap='viridis', s=10, alpha=0.5, label='Carteiras Aleatórias')
+                    plt.colorbar(sc, label='Sharpe Ratio')
+                    
+                    # Plotar pontos ótimos
+                    ax_ef.scatter(vol_sharpe, ret_sharpe, c='red', s=100, marker='*', label='Max Sharpe')
+                    ax_ef.scatter(vol_min_vol, ret_min_vol, c='blue', s=100, marker='D', label='Min Volatilidade')
+                    ax_ef.scatter(vol_max_ret, ret_max_ret, c='green', s=100, marker='^', label='Max Retorno')
+                    
+                    ax_ef.set_title('Fronteira Eficiente (Simulação)')
+                    ax_ef.set_xlabel('Volatilidade Anual')
+                    ax_ef.set_ylabel('Retorno Esperado Anual')
+                    ax_ef.legend()
+                    
+                    st.pyplot(fig_ef)
+
+else:
+    st.info("Utilize a barra lateral para configurar e gerar a carteira.")

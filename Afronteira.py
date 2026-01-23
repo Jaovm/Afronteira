@@ -16,38 +16,50 @@ st.set_page_config(page_title="Otimizador de Markowitz", layout="wide")
 def get_data(tickers, period):
     """
     Baixa dados do Yahoo Finance e trata sufixos .SA.
+    Versão corrigida para compatibilidade com yfinance atualizado.
     """
     if not tickers:
         return None
     
-    # Tratamento dos tickers (garantir .SA para ações brasileiras se não houver)
+    # Tratamento dos tickers
     ticker_list = [t.strip().upper() for t in tickers.split(',')]
     processed_tickers = []
     for t in ticker_list:
         if not t.endswith('.SA') and not t.endswith('.JO') and '^' not in t and len(t) < 6:
-            # Assunção simples: se for curto e sem sufixo, tenta adicionar .SA
-            # (Pode ser ajustado conforme necessidade)
             processed_tickers.append(f"{t}.SA")
         else:
             processed_tickers.append(t)
             
     try:
-        data = yf.download(processed_tickers, period=f"{period}y")['Adj Close']
+        # CORREÇÃO: auto_adjust=False garante que 'Adj Close' venha na resposta
+        # multi_level_index=False (opcional em algumas versões) ajuda a simplificar
+        raw_data = yf.download(processed_tickers, period=f"{period}y", auto_adjust=False)
     except Exception as e:
         st.error(f"Erro ao baixar dados: {e}")
         return None
 
     # Verifica se algum dado foi baixado
-    if data is None or data.empty:
+    if raw_data is None or raw_data.empty:
+        return None
+
+    # Lógica robusta para selecionar a coluna de preço
+    # Tenta pegar 'Adj Close', se não existir, tenta 'Close'
+    if 'Adj Close' in raw_data:
+        data = raw_data['Adj Close']
+    elif 'Close' in raw_data:
+        data = raw_data['Close']
+    else:
+        st.error("Não foi possível encontrar colunas de preço ('Adj Close' ou 'Close').")
         return None
     
     # Remove colunas vazias (tickers inválidos)
     data = data.dropna(axis=1, how='all')
     
-    # Remove linhas com NaN (datas sem negociação para algum ativo)
+    # Remove linhas com NaN
     data = data.dropna()
     
     return data
+
 
 def calculate_metrics(data):
     """

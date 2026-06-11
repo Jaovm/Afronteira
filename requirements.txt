@@ -1,7 +1,9 @@
-streamlit
-numpy
-pandas
-scipy
-yfinance
+streamlit  
+pandas  
+numpy  
+yfinance  
+plotly  
+datetime
 matplotlib
-seaborn
+brfunds
+scipy

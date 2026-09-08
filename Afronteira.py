@@ -1332,12 +1332,7 @@ with tab_ef:
             height=560, margin=dict(t=60, b=140),
         ))
         st.plotly_chart(fig_ef, use_container_width=True)
-        st.caption(
-            "💡 Passe o mouse sobre a linha da **Fronteira Eficiente** para ver, em cada ponto de "
-            "risco/retorno: o **Índice de Sharpe**, o **nº efetivo de ativos** (1/HHI — quanto maior, "
-            "mais diversificada a carteira naquele ponto), o **turnover** necessário a partir da "
-            "carteira atual, e a **alocação completa** — todos os ativos com peso relevante, cada um "
-            "com seu percentual, sem agrupar em '+N outra(s)'."
+
         )
 
         # ── Comparativo de Alocação ───────────────────────────────────────────

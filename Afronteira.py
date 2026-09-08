@@ -150,52 +150,21 @@ def metric_card(label: str, value: str, accent_color: str = None, value_class: s
     )
 
 
-def format_alloc_hover(weights_arr, asset_names, min_pct: float = 0.5, top_n: int = 12,
-                        current_weights=None) -> str:
+def format_alloc_hover(weights_arr, asset_names, min_pct: float = 0.05) -> str:
     """
     Formata a alocação (pesos) de uma carteira como uma string HTML multi-linha,
     pronta para uso em `customdata` + `hovertemplate` do Plotly.
 
-    Mostra as posições relevantes (peso >= min_pct%) em ordem decrescente,
-    limitadas a `top_n` linhas — o restante é agrupado em "+N outra(s)" para
-    não poluir o tooltip quando há muitos ativos com peso pequeno.
-
-    Cada linha traz uma mini-barra proporcional ao peso (relativa à maior
-    posição mostrada) e, quando `current_weights` é informado, a variação em
-    pontos percentuais frente à carteira atual (▲ aumento, ▼ redução, ▬ estável).
+    Lista TODAS as posições relevantes (peso >= min_pct%, para filtrar apenas
+    ruído numérico do otimizador) em ordem decrescente — sem agrupar em
+    "+N outra(s)" — mostrando o nome de cada ativo e a quantidade (%) alocada.
     """
     w = np.asarray(weights_arr, dtype=float)
-    cur_map = dict(zip(asset_names, current_weights)) if current_weights is not None else None
-
     pairs = sorted(zip(asset_names, w), key=lambda p: p[1], reverse=True)
     relevant = [(a, wt) for a, wt in pairs if wt * 100 >= min_pct]
     if not relevant:
         return "sem posições relevantes"
-
-    shown, rest = relevant[:top_n], relevant[top_n:]
-    max_w = shown[0][1] if shown[0][1] > 1e-9 else 1.0
-
-    lines = []
-    for a, wt in shown:
-        pct     = wt * 100
-        bar_len = max(1, round((wt / max_w) * 8))
-        bar     = "▪" * bar_len
-        delta   = ""
-        if cur_map is not None:
-            d = (wt - cur_map.get(a, 0.0)) * 100
-            if d > 0.05:
-                delta = f"  ▲{d:.1f}p.p."
-            elif d < -0.05:
-                delta = f"  ▼{abs(d):.1f}p.p."
-            else:
-                delta = "  ▬ estável"
-        lines.append(f"{a}  {bar}  {pct:.1f}%{delta}")
-
-    if rest:
-        rest_pct = sum(wt for _, wt in rest)
-        lines.append(f"+{len(rest)} outra(s): {rest_pct * 100:.1f}%")
-
-    return "<br>".join(lines)
+    return "<br>".join(f"{a}: {wt * 100:.1f}%" for a, wt in relevant)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1302,7 +1271,7 @@ with tab_ef:
         frontier_customdata = []
         for w_pt, vol_pt, ret_pt in zip(frontier_weights, frontier_vols, frontier_rets):
             w_pt_norm = w_pt / w_pt.sum() if w_pt.sum() > 1e-9 else w_pt
-            alloc_str = format_alloc_hover(w_pt_norm, active_assets, current_weights=w_cur)
+            alloc_str = format_alloc_hover(w_pt_norm, active_assets)
             sharpe_pt = (ret_pt - rf_rate) / vol_pt if vol_pt > 1e-9 else 0.0
             hhi       = float(np.sum(w_pt_norm ** 2))
             n_eff     = (1.0 / hhi) if hhi > 1e-9 else 0.0
@@ -1318,7 +1287,7 @@ with tab_ef:
                 "<b>Fronteira Eficiente</b><br>"
                 "Retorno: %{y:.2%}   |   Volatilidade: %{x:.2%}   |   Sharpe: %{customdata[1]:.2f}<br>"
                 "Nº efetivo de ativos: %{customdata[2]:.1f}   |   Turnover vs. atual: %{customdata[3]:.1f}%<br>"
-                "<br><b>Alocação nesse ponto</b> (Δ p.p. vs. carteira atual):<br>%{customdata[0]}"
+                "<br><b>Alocação completa nesse ponto:</b><br>%{customdata[0]}"
                 "<extra></extra>"
             ),
         ))
@@ -1367,8 +1336,8 @@ with tab_ef:
             "💡 Passe o mouse sobre a linha da **Fronteira Eficiente** para ver, em cada ponto de "
             "risco/retorno: o **Índice de Sharpe**, o **nº efetivo de ativos** (1/HHI — quanto maior, "
             "mais diversificada a carteira naquele ponto), o **turnover** necessário a partir da "
-            "carteira atual e o detalhamento de peso por ação, com a mini-barra proporcional ao peso "
-            "e a variação em pontos percentuais (▲/▼) frente à sua alocação atual."
+            "carteira atual, e a **alocação completa** — todos os ativos com peso relevante, cada um "
+            "com seu percentual, sem agrupar em '+N outra(s)'."
         )
 
         # ── Comparativo de Alocação ───────────────────────────────────────────

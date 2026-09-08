@@ -1333,7 +1333,6 @@ with tab_ef:
         ))
         st.plotly_chart(fig_ef, use_container_width=True)
 
-        )
 
         # ── Comparativo de Alocação ───────────────────────────────────────────
         st.markdown("<div class='section-header'>Comparativo de Alocação</div>", unsafe_allow_html=True)

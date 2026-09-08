@@ -150,7 +150,8 @@ def metric_card(label: str, value: str, accent_color: str = None, value_class: s
     )
 
 
-def format_alloc_hover(weights_arr, asset_names, min_pct: float = 0.5, top_n: int = 10) -> str:
+def format_alloc_hover(weights_arr, asset_names, min_pct: float = 0.5, top_n: int = 12,
+                        current_weights=None) -> str:
     """
     Formata a alocação (pesos) de uma carteira como uma string HTML multi-linha,
     pronta para uso em `customdata` + `hovertemplate` do Plotly.
@@ -158,16 +159,42 @@ def format_alloc_hover(weights_arr, asset_names, min_pct: float = 0.5, top_n: in
     Mostra as posições relevantes (peso >= min_pct%) em ordem decrescente,
     limitadas a `top_n` linhas — o restante é agrupado em "+N outra(s)" para
     não poluir o tooltip quando há muitos ativos com peso pequeno.
+
+    Cada linha traz uma mini-barra proporcional ao peso (relativa à maior
+    posição mostrada) e, quando `current_weights` é informado, a variação em
+    pontos percentuais frente à carteira atual (▲ aumento, ▼ redução, ▬ estável).
     """
-    pairs = sorted(zip(asset_names, weights_arr), key=lambda p: p[1], reverse=True)
-    relevant = [(a, w) for a, w in pairs if w * 100 >= min_pct]
+    w = np.asarray(weights_arr, dtype=float)
+    cur_map = dict(zip(asset_names, current_weights)) if current_weights is not None else None
+
+    pairs = sorted(zip(asset_names, w), key=lambda p: p[1], reverse=True)
+    relevant = [(a, wt) for a, wt in pairs if wt * 100 >= min_pct]
     if not relevant:
         return "sem posições relevantes"
+
     shown, rest = relevant[:top_n], relevant[top_n:]
-    lines = [f"{a}: {w * 100:.1f}%" for a, w in shown]
+    max_w = shown[0][1] if shown[0][1] > 1e-9 else 1.0
+
+    lines = []
+    for a, wt in shown:
+        pct     = wt * 100
+        bar_len = max(1, round((wt / max_w) * 8))
+        bar     = "▪" * bar_len
+        delta   = ""
+        if cur_map is not None:
+            d = (wt - cur_map.get(a, 0.0)) * 100
+            if d > 0.05:
+                delta = f"  ▲{d:.1f}p.p."
+            elif d < -0.05:
+                delta = f"  ▼{abs(d):.1f}p.p."
+            else:
+                delta = "  ▬ estável"
+        lines.append(f"{a}  {bar}  {pct:.1f}%{delta}")
+
     if rest:
-        rest_pct = sum(w for _, w in rest)
+        rest_pct = sum(wt for _, wt in rest)
         lines.append(f"+{len(rest)} outra(s): {rest_pct * 100:.1f}%")
+
     return "<br>".join(lines)
 
 
@@ -1267,18 +1294,31 @@ with tab_ef:
         indiv_vols = [float(np.sqrt(Sigma_np[i, i])) for i in range(n_assets)]
         indiv_rets = [float(mu_np[i])                 for i in range(n_assets)]
 
-        # Texto HTML (uma string por ponto) com a alocação daquele ponto da fronteira
-        frontier_hover_alloc = [format_alloc_hover(w, active_assets) for w in frontier_weights]
+        # Customdata por ponto da fronteira — uma linha por ponto, com:
+        #   [0] alocação (HTML, com Δ p.p. vs. carteira atual)
+        #   [1] Índice de Sharpe daquele ponto
+        #   [2] Nº efetivo de ativos (1/HHI — quanto maior, mais diversificado)
+        #   [3] Turnover (%) frente à carteira atual
+        frontier_customdata = []
+        for w_pt, vol_pt, ret_pt in zip(frontier_weights, frontier_vols, frontier_rets):
+            w_pt_norm = w_pt / w_pt.sum() if w_pt.sum() > 1e-9 else w_pt
+            alloc_str = format_alloc_hover(w_pt_norm, active_assets, current_weights=w_cur)
+            sharpe_pt = (ret_pt - rf_rate) / vol_pt if vol_pt > 1e-9 else 0.0
+            hhi       = float(np.sum(w_pt_norm ** 2))
+            n_eff     = (1.0 / hhi) if hhi > 1e-9 else 0.0
+            turnover  = float(np.sum(np.abs(w_pt_norm - w_cur))) / 2.0 * 100
+            frontier_customdata.append([alloc_str, sharpe_pt, n_eff, turnover])
 
         fig_ef = go.Figure()
         fig_ef.add_trace(go.Scatter(
             x=frontier_vols, y=frontier_rets, mode="lines", name="Fronteira Eficiente",
             line=dict(color=CORP["primary"], width=3),
-            customdata=frontier_hover_alloc,
+            customdata=frontier_customdata,
             hovertemplate=(
                 "<b>Fronteira Eficiente</b><br>"
-                "Retorno: %{y:.2%}   |   Volatilidade: %{x:.2%}<br>"
-                "<br><b>Alocação nesse ponto:</b><br>%{customdata}"
+                "Retorno: %{y:.2%}   |   Volatilidade: %{x:.2%}   |   Sharpe: %{customdata[1]:.2f}<br>"
+                "Nº efetivo de ativos: %{customdata[2]:.1f}   |   Turnover vs. atual: %{customdata[3]:.1f}%<br>"
+                "<br><b>Alocação nesse ponto</b> (Δ p.p. vs. carteira atual):<br>%{customdata[0]}"
                 "<extra></extra>"
             ),
         ))
@@ -1322,55 +1362,14 @@ with tab_ef:
                              font_color=CORP["text_main"], align="left"),
             height=560, margin=dict(t=60, b=140),
         ))
-        ef_event = st.plotly_chart(
-            fig_ef, use_container_width=True,
-            on_select="rerun", selection_mode="points", key="fig_ef_select",
+        st.plotly_chart(fig_ef, use_container_width=True)
+        st.caption(
+            "💡 Passe o mouse sobre a linha da **Fronteira Eficiente** para ver, em cada ponto de "
+            "risco/retorno: o **Índice de Sharpe**, o **nº efetivo de ativos** (1/HHI — quanto maior, "
+            "mais diversificada a carteira naquele ponto), o **turnover** necessário a partir da "
+            "carteira atual e o detalhamento de peso por ação, com a mini-barra proporcional ao peso "
+            "e a variação em pontos percentuais (▲/▼) frente à sua alocação atual."
         )
-        st.caption("💡 Passe o mouse sobre a linha da **Fronteira Eficiente** para ver a alocação, "
-                    "ou **clique em um ponto da linha** para fixar a tabela de alocação detalhada abaixo.")
-
-        # ── Alocação do Ponto Clicado na Fronteira ────────────────────────────
-        st.markdown("<div class='section-header'>📍 Alocação no Ponto Selecionado da Fronteira</div>", unsafe_allow_html=True)
-
-        sel_points = (ef_event.get("selection", {}) or {}).get("points", []) if ef_event else []
-        # A linha "Fronteira Eficiente" é o primeiro trace (curve_number == 0)
-        frontier_click = next((p for p in sel_points if p.get("curve_number") == 0), None)
-
-        if frontier_click is None:
-            st.caption("👆 Clique em qualquer ponto sobre a linha azul da **Fronteira Eficiente**, no gráfico acima, "
-                       "para ver aqui a alocação (peso por ação) daquele ponto de risco/retorno.")
-        else:
-            idx_click  = frontier_click["point_index"]
-            w_click    = frontier_weights[idx_click]
-            ret_click  = frontier_rets[idx_click]
-            vol_click  = frontier_vols[idx_click]
-            shrp_click = (ret_click - rf_rate) / vol_click if vol_click > 1e-9 else 0.0
-
-            mcc1, mcc2, mcc3 = st.columns(3)
-            mcc1.markdown(metric_card("Retorno (a.a.)", f"{ret_click:.2%}", CORP["primary"]), unsafe_allow_html=True)
-            mcc2.markdown(metric_card("Volatilidade (a.a.)", f"{vol_click:.2%}", CORP["warning"]), unsafe_allow_html=True)
-            mcc3.markdown(metric_card("Índice de Sharpe", f"{shrp_click:.2f}", CORP["success"]), unsafe_allow_html=True)
-
-            df_click = pd.DataFrame({
-                "Peso na Fronteira (%)": np.round(w_click * 100, 2),
-                "⭐ Peso Atual (%)":      np.round(w_cur   * 100, 2),
-            }, index=active_assets)
-            df_click.index.name = "Ação"
-            df_click["Diferença (p.p.)"] = np.round(
-                df_click["Peso na Fronteira (%)"] - df_click["⭐ Peso Atual (%)"], 2
-            )
-            df_click = df_click.sort_values("Peso na Fronteira (%)", ascending=False)
-
-            st.dataframe(
-                df_click.style.format({
-                    "Peso na Fronteira (%)": "{:.2f}%",
-                    "⭐ Peso Atual (%)":      "{:.2f}%",
-                    "Diferença (p.p.)":      "{:+.2f} p.p.",
-                }).background_gradient(cmap="Blues", subset=["Peso na Fronteira (%)"], vmin=0, vmax=100),
-                use_container_width=True, height=min(430, 60 + 35 * n_assets),
-            )
-            st.caption(f"Ponto {idx_click + 1}/{len(frontier_weights)} da Fronteira Eficiente · "
-                       "**Diferença (p.p.)** = peso na Fronteira menos peso na carteira Atual.")
 
         # ── Comparativo de Alocação ───────────────────────────────────────────
         st.markdown("<div class='section-header'>Comparativo de Alocação</div>", unsafe_allow_html=True)
